@@ -1,4 +1,5 @@
 import os
+import shutil
 import subprocess
 from pathlib import Path
 from shutil import rmtree
@@ -7,6 +8,8 @@ from uuid import uuid4
 
 import pandas as pd
 import tiktoken
+import yaml
+from decouple import config
 from ktem.db.models import engine
 from sqlalchemy.orm import Session
 from theflow.settings import settings
@@ -54,7 +57,7 @@ def prepare_graph_index_path(graph_id: str):
 class GraphRAGIndexingPipeline(IndexDocumentPipeline):
     """GraphRAG specific indexing pipeline"""
 
-    def route(self, file_path: Path) -> IndexPipeline:
+    def route(self, file_path: str | Path) -> IndexPipeline:
         """Simply disable the splitter (chunking) for this pipeline"""
         pipeline = super().route(file_path)
         pipeline.splitter = None
@@ -115,6 +118,16 @@ class GraphRAGIndexingPipeline(IndexDocumentPipeline):
         result = subprocess.run(command, capture_output=True, text=True)
         print(result.stdout)
         command = command[:-1]
+
+        # copy customized GraphRAG config file if it exists
+        if config("USE_CUSTOMIZED_GRAPHRAG_SETTING", default="value").lower() == "true":
+            setting_file_path = os.path.join(os.getcwd(), "settings.yaml.example")
+            destination_file_path = os.path.join(input_path, "settings.yaml")
+            try:
+                shutil.copy(setting_file_path, destination_file_path)
+            except shutil.Error:
+                # Handle the error if the file copy fails
+                print("failed to copy customized GraphRAG config file. ")
 
         # Run the command and stream stdout
         with subprocess.Popen(command, stdout=subprocess.PIPE, text=True) as process:
@@ -177,15 +190,8 @@ class GraphRAGRetrieverPipeline(BaseFileIndexRetriever):
 
         root_path, _ = prepare_graph_index_path(graph_id)
         output_path = root_path / "output"
-        child_paths = sorted(
-            list(output_path.iterdir()), key=lambda x: x.stem, reverse=True
-        )
 
-        # get the latest child path
-        assert child_paths, "GraphRAG index output not found"
-        latest_child_path = Path(child_paths[0]) / "artifacts"
-
-        INPUT_DIR = latest_child_path
+        INPUT_DIR = output_path
         LANCEDB_URI = str(INPUT_DIR / "lancedb")
         COMMUNITY_REPORT_TABLE = "create_final_community_reports"
         ENTITY_TABLE = "create_final_nodes"
@@ -228,10 +234,28 @@ class GraphRAGRetrieverPipeline(BaseFileIndexRetriever):
         text_unit_df = pd.read_parquet(f"{INPUT_DIR}/{TEXT_UNIT_TABLE}.parquet")
         text_units = read_indexer_text_units(text_unit_df)
 
-        embedding_model = os.getenv("GRAPHRAG_EMBEDDING_MODEL")
+        # initialize default settings
+        embedding_model = os.getenv(
+            "GRAPHRAG_EMBEDDING_MODEL", "text-embedding-3-small"
+        )
+        embedding_api_key = os.getenv("GRAPHRAG_API_KEY")
+        embedding_api_base = None
+
+        # use customized GraphRAG settings if the flag is set
+        if config("USE_CUSTOMIZED_GRAPHRAG_SETTING", default="value").lower() == "true":
+            settings_yaml_path = Path(root_path) / "settings.yaml"
+            with open(settings_yaml_path, "r") as f:
+                settings = yaml.safe_load(f)
+            if settings["embeddings"]["llm"]["model"]:
+                embedding_model = settings["embeddings"]["llm"]["model"]
+            if settings["embeddings"]["llm"]["api_key"]:
+                embedding_api_key = settings["embeddings"]["llm"]["api_key"]
+            if settings["embeddings"]["llm"]["api_base"]:
+                embedding_api_base = settings["embeddings"]["llm"]["api_base"]
+
         text_embedder = OpenAIEmbedding(
-            api_key=os.getenv("OPENAI_API_KEY"),
-            api_base=None,
+            api_key=embedding_api_key,
+            api_base=embedding_api_base,
             api_type=OpenaiApiType.OpenAI,
             model=embedding_model,
             deployment_name=embedding_model,
